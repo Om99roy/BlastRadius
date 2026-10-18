@@ -2,7 +2,7 @@
 
 Graph-powered incident-response agent. Ask "paymentservice is failing, who do I page?" and get the blast radius, owners, past incidents, runbooks, and architecture decisions. Every fact comes from a **FalkorDB** graph traversal, shown live in a 3D graph with the Cypher behind each step.
 
-- **Live demo:** `[<your-live-url>](https://blastradius-cyvg.onrender.com/)`
+- **Live demo:** `[https://blastradius-cyvg.onrender.com/]`
 - **Demo video:** `[<your-video-url>](https://youtu.be/eRM70_uqc_A)`
 - **Hackathon:** WeMakeDevs x FalkorDB, *Graph Hacks: Context for AI Agents*
 
