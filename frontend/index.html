@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BlastRadius: graph-powered incident agent</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#272c36; --text:#e6e8ee; --mute:#8b93a5;
+          --accent:#7c6cff; --red:#ff5d5d; --orange:#ffa94d; --blue:#4dabf7; }
+  * { box-sizing: border-box; }
+  html, body { height:100%; margin:0; background:var(--bg); color:var(--text);
+               font:14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display:flex; align-items:center; gap:12px; padding:10px 16px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0; }
+  header span { color:var(--mute); font-size:12px; }
+  main { display:grid; grid-template-columns: 380px 1fr 400px; height:calc(100% - 45px); }
+  section { display:flex; flex-direction:column; min-height:0; border-right:1px solid var(--line); }
+  section:last-child { border-right:0; }
+  .title { display:flex; justify-content:space-between; align-items:center; padding:8px 14px; font-size:11px; letter-spacing:.08em; text-transform:uppercase;
+           color:var(--mute); border-bottom:1px solid var(--line); }
+  .scroll { flex:1; overflow:auto; padding:12px 14px; }
+  #graph { flex:1; min-height:0; }
+  .msg { margin-bottom:12px; }
+  .msg.user { background:var(--panel); border:1px solid var(--line); padding:8px 10px; border-radius:8px; }
+  .status { color:var(--mute); font-size:12px; margin-bottom:6px; }
+  .answer li { margin-left:18px; }
+  .answer h4 { margin:12px 0 4px; font-size:13px; color:var(--accent); }
+  code { background:#0b0d11; padding:1px 5px; border-radius:4px; font-size:12px; }
+  form { display:flex; gap:8px; padding:10px 14px; border-top:1px solid var(--line); }
+  input[type=text] { flex:1; background:var(--panel); color:var(--text); border:1px solid var(--line);
+                     border-radius:8px; padding:9px 10px; font:inherit; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:0 14px; font:inherit; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; padding:0 14px 10px; }
+  .chip { background:var(--panel); border:1px solid var(--line); color:var(--mute); padding:3px 9px;
+          border-radius:999px; font-size:12px; cursor:pointer; }
+  .chip:hover { color:var(--text); }
+  .step { background:var(--panel); border:1px solid var(--line); border-radius:8px; margin-bottom:10px; overflow:hidden; }
+  .step.active { border-color:var(--accent); }
+  .step .head { padding:6px 10px; display:flex; justify-content:space-between; font-weight:600; }
+  .step .head small { color:var(--mute); font-weight:400; }
+  pre { margin:0; padding:8px 10px; background:#0b0d11; color:#b9c2d6; font-size:11.5px; overflow:auto; white-space:pre-wrap; }
+  details { padding:0 10px 8px; color:var(--mute); font-size:12px; }
+  details pre { margin-top:6px; }
+  .tbtn { background:var(--panel); border:1px solid var(--line); color:var(--mute); border-radius:6px;
+          padding:2px 9px; margin-left:6px; font-size:11px; cursor:pointer; letter-spacing:0; text-transform:none; }
+  .tbtn:hover { color:var(--text); }
+  #graph { position:relative; cursor:grab; } #graph:active { cursor:grabbing; }
+  .legend { flex-wrap:wrap; display:flex; gap:14px; padding:6px 14px; font-size:12px; color:var(--mute); border-top:1px solid var(--line); }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px; }
+  @media (max-width: 1000px) { main { grid-template-columns:1fr; grid-auto-rows: minmax(360px, auto); height:auto; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>BlastRadius</h1>
+  <span>Incident agent where every answer is a FalkorDB graph traversal</span>
+</header>
+<main>
+  <section>
+    <div class="title">Investigation</div>
+    <div class="scroll" id="chat"></div>
+    <div class="chips" id="chips"></div>
+    <form id="form" onsubmit="return false;">
+      <input type="text" id="q" placeholder="e.g. paymentservice is failing. Who do I page?" autocomplete="off">
+      <button id="go" type="submit">Ask</button>
+    </form>
+  </section>
+  <section>
+    <div class="title"><span>Live graph 3D: drag a node to stretch it, drag the background to rotate</span>
+      <span><button class="tbtn" id="fit">Fit view</button><button class="tbtn" id="clear">Reset</button></span></div>
+    <div id="graph"></div>
+    <div class="legend" id="legend"></div>
+  </section>
+  <section>
+    <div class="title">Cypher and evidence</div>
+    <div class="scroll" id="evidence"><div class="status">Graph queries will appear here as the agent runs them.</div></div>
+  </section>
+</main>
+
+<script type="module">
+let ForceGraph3D, SpriteText;
+async function importFirst(urls) {
+  for (const u of urls) {
+    try { return (await import(u)).default; }
+    catch (e) { console.warn("import failed:", u, e); }
+  }
+  throw new Error("Could not load " + urls[0]);
+}
+
+const API = new URLSearchParams(location.search).get("api") || "";
+const TENANT = "acme";
+const SAMPLES = ["paymentservice is failing. What is the impact and who should I page?",
+                 "catalog-db has connection errors",
+                 "smtp-relay is down"];
+
+// ---- tuning knobs ----
+const NODE_LABEL_NEAR = 340;   // node labels (non-service) fade in inside this camera distance
+const EDGE_LABEL_NEAR = 210;   // relationship labels fade in inside this camera distance
+const SERVICE_LABEL_MIN = 0.95; // service labels stay faintly visible when zoomed out
+
+const TYPE_COLOR = { Service:"#8b7bff", Person:"#e0a458", Incident:"#4d84ff",
+                     Decision:"#ef6f9a", Runbook:"#d46bd1", Doc:"#4cc38a" };
+const STATE_COLOR = { affected:"#ff5d5d", impacted:"#ffa94d", queried:"#4dabf7" };
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+
+// ---------- 3D graph ----------
+let Graph, nodeById = new Map();
+const nodeState = new Map();          // id -> affected | impacted | queried
+const nodeLabels = new Map();         // id -> SpriteText
+const linkLabels = [];                // SpriteText[]
+const endId = e => (typeof e === "object" ? e.id : e);
+const linkHot = l => nodeState.has(endId(l.source)) && nodeState.has(endId(l.target));
+let focusId = null, dragging = false;       // node under the mouse / being dragged
+const neighbors = new Map();                 // id -> Set of connected ids
+const addNb = (a, b) => { if (!neighbors.has(a)) neighbors.set(a, new Set()); neighbors.get(a).add(b); };
+const inFocus = id => focusId !== null && (id === focusId || (neighbors.get(focusId) || new Set()).has(id));
+const touchesFocus = l => focusId !== null && (endId(l.source) === focusId || endId(l.target) === focusId);
+const mix = (hex, t) => {                    // blend a color toward the dark background
+  const c = parseInt(hex.slice(1), 16), bg = [15, 17, 21];
+  return "#" + [(c >> 16) & 255, (c >> 8) & 255, c & 255]
+    .map((v, i) => Math.round(v * (1 - t) + bg[i] * t).toString(16).padStart(2, "0")).join("");
+};
+const setFocus = n => { const id = n ? n.id : null; if (id !== focusId) { focusId = id; refreshStyles(); } };
+const radius = n => (n.type === "Service" ? 4.2 : 2.6)
+  * (nodeState.get(n.id) === "affected" ? 1.5 : nodeState.has(n.id) ? 1.2 : 1)
+  * (focusId === n.id ? 1.35 : 1);
+
+function refreshStyles() {
+  const base = n => STATE_COLOR[nodeState.get(n.id)] || TYPE_COLOR[n.type] || "#7a8296";
+  Graph.nodeColor(n => (focusId !== null && !inFocus(n.id)) ? mix(base(n), 0.72) : base(n))
+       .nodeVal(n => Math.pow(radius(n) / 2.2, 3))
+       .linkColor(l => focusId !== null ? (touchesFocus(l) ? "#c26bff" : "#2b303d")
+                                        : (linkHot(l) ? "#ffa94d" : "#5b647a"))
+       .linkWidth(l => touchesFocus(l) ? 1.7 : (focusId !== null ? 0.25 : (linkHot(l) ? 1.6 : 0.35)))
+       .linkDirectionalParticles(l => touchesFocus(l) ? 3 : (focusId === null && linkHot(l) ? 4 : 0));
+}
+
+function makeLabel(text, height, color) {
+  const s = new SpriteText(text, height, color);
+  s.fontFace = "system-ui, -apple-system, 'Segoe UI', sans-serif";
+  s.fontWeight = "600";
+  s.fontSize = 150;                         // high-res canvas = crisp text when zoomed in
+  s.backgroundColor = "rgba(15,17,21,0.82)";
+  s.padding = [5, 2.5];
+  s.borderRadius = 5;
+  s.material.depthTest = false;             // never clipped by nodes or links
+  s.material.depthWrite = false;
+  s.renderOrder = 999;                      // drawn after everything else
+  return s;
+}
+
+async function loadGraph() {
+  ForceGraph3D = await importFirst(["https://esm.sh/3d-force-graph",
+                                    "https://cdn.jsdelivr.net/npm/3d-force-graph/+esm"]);
+  SpriteText = await importFirst(["https://esm.sh/three-spritetext",
+                                  "https://cdn.jsdelivr.net/npm/three-spritetext/+esm"]);
+  const g = await (await fetch(`${API}/api/graph/${TENANT}`)).json();
+  const nodes = g.nodes.map(n => ({ ...n }));
+  const links = g.edges.map(e => ({ source: e.source, target: e.target, rel: e.rel }));
+  nodes.forEach(n => nodeById.set(n.id, n));
+  g.edges.forEach(e => { addNb(e.source, e.target); addNb(e.target, e.source); });
+
+  const el = $("graph");
+  Graph = ForceGraph3D()(el)
+    .backgroundColor("#0f1115")
+    .showNavInfo(false)
+    .enableNodeDrag(true)                // drag a node to stretch the graph; drag empty space to rotate
+    .nodeRelSize(2.2)
+    .nodeResolution(18)
+    .nodeOpacity(0.95)
+    .nodeLabel(n => `<div style="font:12px system-ui;padding:4px 8px;background:#171a21;border:1px solid #272c36;border-radius:6px">
+        <b>${esc(n.id)}</b> <span style="color:#8b93a5">${esc(n.type)}</span>
+        ${n.title ? "<br>" + esc(n.title) : ""}${n.summary ? "<br><i>" + esc(n.summary) + "</i>" : ""}${n.text ? "<br>" + esc(n.text) : ""}</div>`)
+    .nodeThreeObjectExtend(true)
+    .nodeThreeObject(n => {
+      const s = makeLabel(n.id, n.type === "Service" ? 3.4 : 2.6, n.type === "Service" ? "#f1f3fa" : "#c6cde0");
+      s.position.y = -(radius(n) + 3.4);
+      s.material.opacity = n.type === "Service" ? SERVICE_LABEL_MIN : 0;
+      nodeLabels.set(n.id, s);
+      return s;
+    })
+    .linkOpacity(0.55)
+    .linkDirectionalArrowLength(3.5)
+    .linkDirectionalArrowRelPos(1)
+    .linkDirectionalParticleSpeed(0.012)
+    .linkDirectionalParticleWidth(1.4)
+    .linkThreeObjectExtend(true)
+    .linkThreeObject(l => {
+      const s = makeLabel(l.rel.replace(/_/g, " ").toLowerCase(), 2.0, "#e2e7f3");
+      s.__link = l;
+      s.material.opacity = 0;
+      linkLabels.push(s);
+      return s;
+    })
+    .linkPositionUpdate((sprite, { start, end }) => {
+      sprite.position.set((start.x + end.x) / 2, (start.y + end.y) / 2, (start.z + end.z) / 2);
+    })
+    .onNodeHover(n => { if (dragging) return; setFocus(n); el.style.cursor = n ? "pointer" : "grab"; })
+    .onNodeDrag(n => { dragging = true; setFocus(n); el.style.cursor = "grabbing"; })
+    .onNodeDragEnd(n => {                // leave the node where it was dropped
+      dragging = false;
+      n.fx = n.x; n.fy = n.y; n.fz = n.z;
+      el.style.cursor = "pointer";
+    })
+    .onNodeRightClick(n => { n.fx = n.fy = n.fz = undefined; Graph.d3ReheatSimulation(); })  // unpin
+    .onNodeClick(n => flyTo([n], 55))
+    .graphData({ nodes, links });
+
+  // keep clusters tight and readable
+  Graph.d3Force("charge").strength(-55);
+  Graph.d3Force("link").distance(l => (l.rel === "DEPENDS_ON" ? 46 : 22)).strength(0.9);
+
+  const gravity = alpha => {
+    for (const n of nodes) {
+      if (n.x === undefined) continue;
+      n.vx -= n.x * 0.04 * alpha; n.vy -= n.y * 0.04 * alpha; n.vz -= (n.z || 0) * 0.04 * alpha;
+    }
+  };
+  gravity.initialize = () => {};
+  Graph.d3Force("gravity", gravity);
+
+  refreshStyles();
+  let fitted = false;
+  Graph.onEngineStop(() => { if (!fitted) { fitted = true; Graph.zoomToFit(800, 50); } });
+
+  const resize = () => Graph.width(el.clientWidth).height(el.clientHeight);
+  new ResizeObserver(resize).observe(el); resize();
+
+  // labels fade in as the camera gets closer
+  (function tick() {
+    const c = Graph.camera().position;
+    for (const [id, s] of nodeLabels) {
+      const n = nodeById.get(id);
+      if (!n || n.x === undefined) continue;
+      const d = Math.hypot(n.x - c.x, n.y - c.y, n.z - c.z);
+      const near = Math.min(1, Math.max(0, (NODE_LABEL_NEAR - d) / (NODE_LABEL_NEAR * 0.6)));
+      let op = nodeState.has(id) ? 1 : Math.max(n.type === "Service" ? SERVICE_LABEL_MIN : 0, near);
+      if (focusId !== null) op = inFocus(id) ? 1 : Math.min(op, 0.15);
+      s.material.opacity = op;
+    }
+    for (const s of linkLabels) {
+      const p = s.position;
+      const d = Math.hypot(p.x - c.x, p.y - c.y, p.z - c.z);
+      let op = Math.min(1, Math.max(0, (EDGE_LABEL_NEAR - d) / (EDGE_LABEL_NEAR * 0.5)));
+      if (focusId !== null) op = touchesFocus(s.__link) ? 1 : 0;
+      s.material.opacity = op;
+    }
+    requestAnimationFrame(tick);
+  })();
+
+  // legend
+  $("legend").innerHTML =
+    Object.entries(TYPE_COLOR).map(([t, c]) => `<span><i class="dot" style="background:${c}"></i>${t}</span>`).join("") +
+    Object.entries({ affected: "affected", impacted: "impacted", queried: "queried by tool" })
+      .map(([k, t]) => `<span><i class="dot" style="background:${STATE_COLOR[k]}"></i>${t}</span>`).join("");
+}
+
+function flyTo(nodes, minDist = 80) {
+  const pts = nodes.filter(n => n && n.x !== undefined);
+  if (!pts.length) return;
+  const c = { x: 0, y: 0, z: 0 };
+  pts.forEach(n => { c.x += n.x / pts.length; c.y += n.y / pts.length; c.z += n.z / pts.length; });
+  const spread = Math.max(...pts.map(n => Math.hypot(n.x - c.x, n.y - c.y, n.z - c.z)));
+  const dist = Math.max(minDist, spread * 2.4 + 40);
+  const r = Math.hypot(c.x, c.y, c.z) || 1;
+  const k = 1 + dist / r;
+  Graph.cameraPosition({ x: c.x * k, y: c.y * k, z: c.z * k }, c, 900);
+}
+
+function clearHighlights() { nodeState.clear(); refreshStyles(); }
+
+function collectStrings(x, out) {
+  if (typeof x === "string") out.add(x);
+  else if (Array.isArray(x)) x.forEach(v => collectStrings(v, out));
+  else if (x && typeof x === "object") Object.values(x).forEach(v => collectStrings(v, out));
+}
+
+function highlight(ev, input) {
+  const keys = new Set(ev.path || []);
+  if (ev.name !== "blast_radius") collectStrings(ev.data, keys);   // people, incidents, runbooks, decisions...
+  keys.forEach(k => {
+    if (!nodeById.has(k) || nodeState.get(k) === "affected") return;
+    nodeState.set(k, ev.name === "blast_radius" ? "impacted" : (nodeState.get(k) || "queried"));
+  });
+  if (ev.name === "blast_radius" && input.service) nodeState.set(input.service, "affected");
+  refreshStyles();
+  flyTo([...nodeState.keys()].map(k => nodeById.get(k)), 90);
+}
+
+$("fit").onclick = () => Graph && Graph.zoomToFit(700, 50);
+$("clear").onclick = () => {
+  if (!Graph) return;
+  nodeById.forEach(n => { n.fx = n.fy = n.fz = undefined; });   // unpin dragged nodes
+  focusId = null; clearHighlights();
+  Graph.d3ReheatSimulation();
+  setTimeout(() => Graph.zoomToFit(700, 50), 1200);
+};
+
+// ---------- chat / evidence rendering ----------
+function md(text) {
+  const lines = esc(text).split("\n");
+  let html = "", inList = false;
+  for (let line of lines) {
+    line = line.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/`(.+?)`/g, "<code>$1</code>");
+    const li = line.match(/^\s*[-*]\s+(.*)/);
+    const h = line.match(/^\s*\d+\.\s+(.*)/);
+    if (li) { if (!inList) { html += "<ul>"; inList = true; } html += `<li>${li[1]}</li>`; continue; }
+    if (inList) { html += "</ul>"; inList = false; }
+    if (h) html += `<h4>${h[1]}</h4>`;
+    else if (line.trim()) html += `<p>${line}</p>`;
+  }
+  return html + (inList ? "</ul>" : "");
+}
+function addStep(name, input) {
+  const el = document.createElement("div");
+  el.className = "step active";
+  el.innerHTML = `<div class="head"><span>${esc(name)}</span><small>running…</small></div>
+                  <pre>${esc(JSON.stringify(input))}</pre>`;
+  $("evidence").appendChild(el);
+  $("evidence").scrollTop = 1e9;
+  return el;
+}
+function finishStep(el, ev) {
+  el.classList.remove("active");
+  el.querySelector("small").textContent = "graph query";
+  el.querySelector("pre").textContent = ev.cypher || "(no query)";
+  const d = document.createElement("details");
+  d.innerHTML = `<summary>Result</summary><pre>${esc(JSON.stringify(ev.data, null, 2))}</pre>`;
+  el.appendChild(d);
+}
+
+async function ask(question) {
+  $("go").disabled = true;
+  if (Graph) clearHighlights();
+  $("evidence").innerHTML = "";
+  const chat = $("chat");
+  chat.insertAdjacentHTML("beforeend", `<div class="msg user">${esc(question)}</div>`);
+  const out = document.createElement("div");
+  out.className = "msg";
+  out.innerHTML = `<div class="status">Investigating…</div><div class="answer"></div>`;
+  chat.appendChild(out);
+
+  let step = null, lastInput = {};
+  try {
+    const res = await fetch(`${API}/api/ask`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tenant: TENANT, question }),
+    });
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const raw = buf.slice(0, i).trim(); buf = buf.slice(i + 2);
+        if (!raw.startsWith("data:")) continue;
+        const ev = JSON.parse(raw.slice(5));
+        if (ev.type === "cached") {
+          out.querySelector(".status").textContent = "Replaying a saved investigation…";
+        } else if (ev.type === "tool_call") {
+          lastInput = ev.input;
+          out.querySelector(".status").textContent = `Calling ${ev.name}…`;
+          step = addStep(ev.name, ev.input);
+        } else if (ev.type === "tool_result") {
+          if (step) finishStep(step, ev);
+          if (Graph) highlight(ev, lastInput);
+        } else if (ev.type === "final") {
+          out.querySelector(".status").remove();
+          out.querySelector(".answer").innerHTML = md(ev.text);
+        } else if (ev.type === "error") {
+          out.querySelector(".status").textContent = "Error: " + ev.message;
+        }
+        chat.scrollTop = 1e9;
+      }
+    }
+  } catch (e) {
+    out.querySelector(".status").textContent = "Request failed: " + e.message;
+  }
+  $("go").disabled = false;
+}
+
+$("form").addEventListener("submit", e => {
+  e.preventDefault();
+  const q = $("q").value.trim();
+  if (q) { $("q").value = ""; ask(q); }
+});
+SAMPLES.forEach(s => {
+  const c = document.createElement("span");
+  c.className = "chip"; c.textContent = s.length > 38 ? s.slice(0, 36) + "…" : s;
+  c.onclick = () => ask(s);
+  $("chips").appendChild(c);
+});
+loadGraph().catch(e => { $("graph").innerHTML = `<div class="status" style="padding:14px">Graph failed to load: ${esc(e.message)}</div>`; });
+</script>
+</body>
+</html>
