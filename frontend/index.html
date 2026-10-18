@@ -123,32 +123,37 @@ const mix = (hex, t) => {                    // blend a color toward the dark ba
   return "#" + [(c >> 16) & 255, (c >> 8) & 255, c & 255]
     .map((v, i) => Math.round(v * (1 - t) + bg[i] * t).toString(16).padStart(2, "0")).join("");
 };
-const setFocus = n => { const id = n ? n.id : null; if (id !== focusId) { focusId = id; refreshStyles(); } };
+const setFocus = n => { const id = n ? n.id : null; if (id !== focusId) { focusId = id; refreshFocus(); } };
 const radius = n => (n.type === "Service" ? 4.2 : 2.6)
   * (nodeState.get(n.id) === "affected" ? 1.5 : nodeState.has(n.id) ? 1.2 : 1)
   * (focusId === n.id ? 1.35 : 1);
 
-function refreshStyles() {
-  const base = n => STATE_COLOR[nodeState.get(n.id)] || TYPE_COLOR[n.type] || "#7a8296";
-  Graph.nodeColor(n => (focusId !== null && !inFocus(n.id)) ? mix(base(n), 0.72) : base(n))
-       .nodeVal(n => Math.pow(radius(n) / 2.2, 3))
-       .linkColor(l => focusId !== null ? (touchesFocus(l) ? "#c26bff" : "#2b303d")
-                                        : (linkHot(l) ? "#ffa94d" : "#5b647a"))
-       .linkWidth(l => touchesFocus(l) ? 1.7 : (focusId !== null ? 0.25 : (linkHot(l) ? 1.6 : 0.35)))
-       .linkDirectionalParticles(l => touchesFocus(l) ? 3 : (focusId === null && linkHot(l) ? 4 : 0));
+const baseColor = n => STATE_COLOR[nodeState.get(n.id)] || TYPE_COLOR[n.type] || "#7a8296";
+const nodeColorFn = n => (focusId !== null && !inFocus(n.id)) ? mix(baseColor(n), 0.72) : baseColor(n);
+const nodeValFn = n => Math.pow(radius(n) / 2.2, 3);
+const linkColorFn = l => focusId !== null ? (touchesFocus(l) ? "#c26bff" : "#2b303d")
+                                          : (linkHot(l) ? "#ffa94d" : "#5b647a");
+function refreshFocus() {                    // cheap: used on every hover/drag
+  Graph.nodeColor(nodeColorFn).nodeVal(nodeValFn).linkColor(linkColorFn);
+}
+function refreshStyles() {                   // heavier: only when agent highlights change
+  refreshFocus();
+  Graph.linkWidth(l => linkHot(l) ? 1.6 : 0.35)
+       .linkDirectionalParticles(l => linkHot(l) ? 3 : 0);
 }
 
 function makeLabel(text, height, color) {
   const s = new SpriteText(text, height, color);
   s.fontFace = "system-ui, -apple-system, 'Segoe UI', sans-serif";
   s.fontWeight = "600";
-  s.fontSize = 150;                         // high-res canvas = crisp text when zoomed in
+  s.fontSize = 64;                          // modest texture size keeps the GPU happy
   s.backgroundColor = "rgba(15,17,21,0.82)";
-  s.padding = [5, 2.5];
+  s.padding = [4, 2];
   s.borderRadius = 5;
   s.material.depthTest = false;             // never clipped by nodes or links
   s.material.depthWrite = false;
   s.renderOrder = 999;                      // drawn after everything else
+  s.raycast = () => {};                     // labels never steal hover/click
   return s;
 }
 
@@ -169,8 +174,8 @@ async function loadGraph() {
     .showNavInfo(false)
     .enableNodeDrag(true)                // drag a node to stretch the graph; drag empty space to rotate
     .nodeRelSize(2.2)
-    .nodeResolution(18)
-    .nodeOpacity(0.95)
+    .nodeResolution(10)
+    .nodeOpacity(1)
     .nodeLabel(n => `<div style="font:12px system-ui;padding:4px 8px;background:#171a21;border:1px solid #272c36;border-radius:6px">
         <b>${esc(n.id)}</b> <span style="color:#8b93a5">${esc(n.type)}</span>
         ${n.title ? "<br>" + esc(n.title) : ""}${n.summary ? "<br><i>" + esc(n.summary) + "</i>" : ""}${n.text ? "<br>" + esc(n.text) : ""}</div>`)
@@ -207,7 +212,15 @@ async function loadGraph() {
     })
     .onNodeRightClick(n => { n.fx = n.fy = n.fz = undefined; Graph.d3ReheatSimulation(); })  // unpin
     .onNodeClick(n => flyTo([n], 55))
+    .linkResolution(4)
+    .linkDirectionalParticleResolution(4)
+    .warmupTicks(80)
+    .cooldownTicks(200)
+    .d3AlphaDecay(0.04)
     .graphData({ nodes, links });
+
+  // cap pixel ratio: big win on HiDPI screens and phones
+  Graph.renderer().setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
 
   // keep clusters tight and readable
   Graph.d3Force("charge").strength(-55);
@@ -230,7 +243,10 @@ async function loadGraph() {
   new ResizeObserver(resize).observe(el); resize();
 
   // labels fade in as the camera gets closer
+  let tickN = 0;
   (function tick() {
+    requestAnimationFrame(tick);
+    if ((tickN++ % 3) !== 0) return;
     const c = Graph.camera().position;
     for (const [id, s] of nodeLabels) {
       const n = nodeById.get(id);
@@ -239,16 +255,15 @@ async function loadGraph() {
       const near = Math.min(1, Math.max(0, (NODE_LABEL_NEAR - d) / (NODE_LABEL_NEAR * 0.6)));
       let op = nodeState.has(id) ? 1 : Math.max(n.type === "Service" ? SERVICE_LABEL_MIN : 0, near);
       if (focusId !== null) op = inFocus(id) ? 1 : Math.min(op, 0.15);
-      s.material.opacity = op;
+      s.material.opacity = op; s.visible = op > 0.03;
     }
     for (const s of linkLabels) {
       const p = s.position;
       const d = Math.hypot(p.x - c.x, p.y - c.y, p.z - c.z);
       let op = Math.min(1, Math.max(0, (EDGE_LABEL_NEAR - d) / (EDGE_LABEL_NEAR * 0.5)));
       if (focusId !== null) op = touchesFocus(s.__link) ? 1 : 0;
-      s.material.opacity = op;
+      s.material.opacity = op; s.visible = op > 0.03;
     }
-    requestAnimationFrame(tick);
   })();
 
   // legend
